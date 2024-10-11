@@ -14,14 +14,27 @@ import hashlib
 
 import paho.mqtt.client as mqtt
 from flask import Flask, request
+from .inferences import ClassificationTop, ObjectDetectionTop
 
 app = Flask(__name__)
 # TODO: This is hardcoded for now and needs to be changed to the actual Cumulocity URL from tedge config
 C8Y_BASE = 'https://devices.jp.cumulocity.com'
 TMP_DIR = '/tmp/imx'
 HTTP_SERVER_PORT = 50123
+#TODO: this needs to be resolved automatically
+THIN_EDGE_IP = '192.168.2.138'
+#TODO: read from thin-edge config
+THIN_EDGE_EXTERNAL_IP = 'home64-raspberry:device'
 image_cache = queue.Queue(maxsize=10)
+
 inferences_cache = queue.Queue(maxsize=10)
+
+class CumulocityAuthentication():
+    def __init__(self):
+        self.token = None
+        self.source_map = {}
+
+token_auth = CumulocityAuthentication()
 
 # create tmp folder if not existing
 
@@ -69,13 +82,10 @@ logging.basicConfig(
     ]
 )
 
-class CumulocityAuthentication():
-    def __init__(self):
-        self.token = None
-        self.source_map = {}
+
 
 class IMXMqttHandler(mqtt.Client):
-    START_COMMAND = r'start (\d+)'
+    START_COMMAND = r'start (\d+) (\d+)'
     STOP_COMMAND = r'stop'
     TOPIC_CONNECT = r'v1/devices/([\w]+)/connect'
     TOPIC_TELEMETRY = r'v1/devices/([\w]+)/telemetry'
@@ -91,9 +101,7 @@ class IMXMqttHandler(mqtt.Client):
         self.device_id_long_map = {}
         self.pending_installations = {}
         self.existing_installations = {}
-        #TODO: read from thin-edge config
-        self.device_id_prefix = 'home64-raspberry:device'
-        #self.device_id_prefix = 'revpi-office:device'
+        self.device_id_prefix = THIN_EDGE_EXTERNAL_IP
         self.on_message = self.on_message_handle
         self.on_connect = self.on_connect_handle
         self.connect('127.0.0.1', 1883)
@@ -122,10 +130,12 @@ class IMXMqttHandler(mqtt.Client):
             regex_match_stop = re.fullmatch(IMXMqttHandler.STOP_COMMAND, command)
             if regex_match_start != None:
                 interval = int(regex_match_start.group(1))
+                classes = int(regex_match_start.group(2))
                 logging.info(f"Received start command for device {device_id} with interval {interval}")
                 # Set operation to EXECUTING
                 self.device_id_prefix = ":".join(msg_parts[1].split(':')[:-1])
                 self.publish(f'c8y/s/us/{device_id_long}', '501,c8y_Command')
+                self.set_app_configuration(device_id, classes)
                 self.start_sending_data(device_id, interval)
             elif regex_match_stop != None:
                 logging.info(f"Received stop command for device {device_id}")
@@ -207,7 +217,7 @@ class IMXMqttHandler(mqtt.Client):
             "OTA": {
                 "UpdateModule": "DnnModel",
                 "DesiredVersion": desired_version,
-                "PackageUri": "http://192.168.2.138:50123/file/" + self.download_location_model[device_id],
+                "PackageUri": f"http://{THIN_EDGE_IP}:{HTTP_SERVER_PORT}/file/" + self.download_location_model[device_id],
                 "HashValue": self.create_hash_for_file(TMP_DIR + '/' + self.download_location_model[device_id])
             }
         }
@@ -301,7 +311,7 @@ class IMXMqttHandler(mqtt.Client):
                 module_id: {
                     "entryPoint": "main", 
                     "moduleImpl": "wasm", 
-                    "downloadUrl": "http://192.168.2.138:50123/file/" + self.download_location_app[device_id],
+                    "downloadUrl": f"http://{THIN_EDGE_IP}:{HTTP_SERVER_PORT}/file/" + self.download_location_app[device_id],
                     "hash": "0b26aedff2d972cdd3902f0db402af05572bd5e48e660347991f91dc0cc02151"
                     #"hash": self.create_hash_for_file(TMP_DIR + '/' + self.download_location_app[device_id])
                 }
@@ -336,11 +346,10 @@ class IMXMqttHandler(mqtt.Client):
                             logging.info(f"Model installation successful for device {device_id}")
                             self.publish(f'c8y/s/us/{self.device_id_long_map[device_id]}', '503,c8y_SoftwareUpdate')
                             self.message_callback_remove(f'v1/devices/{device_id}/attributes')
-                            self.set_app_configuration(device_id)
 
-    def set_app_configuration(self, device_id):
+    def set_app_configuration(self, device_id, classes):
         # TODO: should be read from a file
-        configuration = {"header": {"id": "00", "version": "01.01.00"}, "dnn_output_classes": 1001, "max_predictions": 1001}
+        configuration = {"header": {"id": "00", "version": "01.01.00"}, "dnn_output_classes": int(classes), "max_predictions": int(classes)}
         message = {
             "configuration/node/PPL_Parameters": base64.encodebytes(json.dumps(configuration).encode()).decode()
         }
@@ -419,10 +428,10 @@ class IMXMqttHandler(mqtt.Client):
                 "params": {
                     "Mode": 1, 
                     "UploadMethod": "HttpStorage", 
-                    "StorageName": "http://192.168.2.138:50123", 
+                    "StorageName": f"http://{THIN_EDGE_IP}:{HTTP_SERVER_PORT}", 
                     "StorageSubDirectoryPath": "images", 
                     "UploadMethodIR": "HttpStorage", 
-                    "StorageNameIR": "http://192.168.2.138:50123", 
+                    "StorageNameIR": f"http://{THIN_EDGE_IP}:{HTTP_SERVER_PORT}", 
                     "UploadInterval": int(interval), 
                     "StorageSubDirectoryPathIR": "inferences", 
                     "CropHOffset": 0, 
@@ -500,8 +509,17 @@ class IMXMqttHandler(mqtt.Client):
     def refresh_token(self):
         self.publish('c8y/s/uat', '')
             
-
-
+def decode_flatbuffer(inference):
+    buf_decode = base64.b64decode(inference)
+    ppl_out = ClassificationTop.ClassificationTop.GetRootAs(buf_decode, 0)
+    cls_data = ppl_out.Perception()
+    res_num = cls_data.ClassificationListLength()
+    # Store the deserialized data in json format.
+    output = {}
+    for i in range(res_num):
+        cls_list = cls_data.ClassificationList(i)
+        output[str(cls_list.ClassId())] = round(cls_list.Score(), 6)
+    return output
 
 def file_uploader():
     while True:
@@ -516,6 +534,7 @@ def file_uploader():
                 'Accept': 'application/json'
             }
             inference_file_id, file_content = inference_item
+            file_content['Inferences'][0]['O'] = decode_flatbuffer(file_content['Inferences'][0]['O'])
             file_content['type'] = 'imx_inference'
             file_content['source'] = {
                 #TODO: this is hardcoded for now and needs to change ones the camera can be identified on HTTP as well
@@ -523,10 +542,8 @@ def file_uploader():
             }
             file_content['time'] = datetime.datetime.strptime(inference_file_id, '%Y%m%d%H%M%S%f').isoformat()[:-3] + 'Z'
             file_content['text'] = 'Inference result'
-            #logging.debug(file_content)
+            logging.debug(f"Created event with content {file_content}")
             response = requests.post(C8Y_BASE + '/event/events', data=json.dumps(file_content), headers=HEADERS)
-            #logging.debug(response.status_code)
-            #logging.debug(response.json())
             eventId = response.json()['id']
             logging.debug(f"Created event with ID {eventId}")
 
@@ -542,7 +559,6 @@ def file_uploader():
 
 def main():
     # Start the Flask server 
-    token_auth = CumulocityAuthentication()
     mqtt_client = IMXMqttHandler(token_auth)
     mqtt_client.loop_start()
     threading.Thread(target=file_uploader, daemon=True).start()

@@ -29,7 +29,7 @@ class ObjectDetectionTop(object):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(4))
         if o != 0:
             x = self._tab.Indirect(o + self._tab.Pos)
-            from SmartCamera.ObjectDetectionData import ObjectDetectionData
+            from .ObjectDetectionData import ObjectDetectionData
             obj = ObjectDetectionData()
             obj.Init(self._tab.Bytes, x)
             return obj
