@@ -8,7 +8,8 @@ setup(
         'requests',
         'paho-mqtt',
         'Flask',
-        'flatbuffers'
+        'flatbuffers',
+        'numpy'
     ],
     entry_points={
         'console_scripts': [

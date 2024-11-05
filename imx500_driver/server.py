@@ -13,6 +13,7 @@ import glob
 import hashlib
 
 import paho.mqtt.client as mqtt
+import numpy as np
 from flask import Flask, request
 from .inferences import ClassificationTop, ObjectDetectionTop
 
@@ -24,7 +25,7 @@ HTTP_SERVER_PORT = 50123
 #TODO: this needs to be resolved automatically
 THIN_EDGE_IP = '192.168.2.138'
 #TODO: read from thin-edge config
-THIN_EDGE_EXTERNAL_IP = 'home64-raspberry:device'
+THIN_EDGE_EXTERNAL_ID = 'home64-raspberry:device'
 image_cache = queue.Queue(maxsize=10)
 
 inferences_cache = queue.Queue(maxsize=10)
@@ -101,7 +102,7 @@ class IMXMqttHandler(mqtt.Client):
         self.device_id_long_map = {}
         self.pending_installations = {}
         self.existing_installations = {}
-        self.device_id_prefix = THIN_EDGE_EXTERNAL_IP
+        self.device_id_prefix = THIN_EDGE_EXTERNAL_ID
         self.on_message = self.on_message_handle
         self.on_connect = self.on_connect_handle
         self.connect('127.0.0.1', 1883)
@@ -321,7 +322,7 @@ class IMXMqttHandler(mqtt.Client):
         }
         app_install_encoded = json.dumps(app_install, indent=None, separators=(',', ':'))
         app_install_message = json.dumps({"deployment": app_install_encoded})
-        logging.info(f"Install new model for device {device_id}")
+        logging.info(f"Install new app for device {device_id}")
         self.message_callback_add(f'v1/devices/{device_id}/attributes', self.finish_app_installation)
         self.publish(f'v1/devices/{device_id}/attributes', app_install_message)
         del self.download_location_app[device_id]
@@ -343,7 +344,7 @@ class IMXMqttHandler(mqtt.Client):
                     # TODO: still hardocded
                     if 'node-0b26a' in modules.keys():
                         if modules['node-0b26a']['status'] == 'ok':
-                            logging.info(f"Model installation successful for device {device_id}")
+                            logging.info(f"App installation successful for device {device_id}")
                             self.publish(f'c8y/s/us/{self.device_id_long_map[device_id]}', '503,c8y_SoftwareUpdate')
                             self.message_callback_remove(f'v1/devices/{device_id}/attributes')
 
@@ -508,7 +509,18 @@ class IMXMqttHandler(mqtt.Client):
 
     def refresh_token(self):
         self.publish('c8y/s/uat', '')
-            
+
+def softmax(inferences):
+    x = []
+    for i in range(len(inferences.keys())):
+        x.append(inferences[str(i)])
+    e_x = np.exp(x - np.max(x))
+    results = e_x / e_x.sum()
+    results = results.tolist()
+    for i in range(len(results)):
+        inferences[str(i)] = round(results[i],4)
+    return inferences
+
 def decode_flatbuffer(inference):
     buf_decode = base64.b64decode(inference)
     ppl_out = ClassificationTop.ClassificationTop.GetRootAs(buf_decode, 0)
@@ -534,7 +546,9 @@ def file_uploader():
                 'Accept': 'application/json'
             }
             inference_file_id, file_content = inference_item
-            file_content['Inferences'][0]['O'] = decode_flatbuffer(file_content['Inferences'][0]['O'])
+            decoded_flatbuffer = decode_flatbuffer(file_content['Inferences'][0]['O'])
+            softmaxed_inferences = softmax(decoded_flatbuffer)
+            file_content['Inferences'][0]['O'] = softmaxed_inferences
             file_content['type'] = 'imx_inference'
             file_content['source'] = {
                 #TODO: this is hardcoded for now and needs to change ones the camera can be identified on HTTP as well

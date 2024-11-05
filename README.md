@@ -13,7 +13,7 @@ Here is the list of parameters you need to still find in the code and replace (a
 |-----------------|-----------------|
 | C8Y_BASE   | Put the same URL that the thin-edge is connecting to   |
 | THIN_EDGE_IP   | The IP address of the thin-edge device in the local network (where the camera connects on)  |
-| Row 3, Cell 1   | Row 3, Cell 2   |
+| THIN_EDGE_EXTERNAL_ID   | This is the externalId used by the thin-edge. The format should look like "thin-edge-external-id:device"   |
 
 ## Installation
 
@@ -55,3 +55,7 @@ In order to stop sending data go to the Shell and send the following command:
 ```bash
 stop
 ```
+
+## Troubleshoting
+
+If you see an error like "struct.error: unpack_from requires a buffer of at least 3204448260 bytes for unpacking 4 bytes at offset 3204448256 (actual buffer size is 4004)" you forgot to install the vision_app before starting sending data. You will need to restart the driver (and then the camera) to fix this issue. After camera restarted and connect install first the vision_app.
