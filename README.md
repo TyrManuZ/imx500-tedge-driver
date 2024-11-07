@@ -42,13 +42,15 @@ Note that the vision app is not persisted on the camera. If you restart the came
 
 In order to start sending data go to the Shell and send the following command:
 ```bash
-start ${frequency} ${classes}
+start ${frequency} ${classes} ${cloud/local} ${pic_on/off} 
 ```
 The frequency is the number of frames until you send (= send every x frames). 
-The classes is the amount of classes your model outputs (this is important for parsing the output of the camera)
+The classes is the amount of classes your model outputs (this is important for parsing the output of the camera).
+The cloud/local defines wether you want to send the data to the cloud or to the local thin-edge only.
+The pic_on/off defines wether you want to send the picture with the data or not.
 Example:
 ```bash
-start 100 10
+start 100 1001 cloud on
 ```
 
 In order to stop sending data go to the Shell and send the following command:

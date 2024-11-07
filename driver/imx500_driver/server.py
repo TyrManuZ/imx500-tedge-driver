@@ -26,6 +26,7 @@ HTTP_SERVER_PORT = 50123
 THIN_EDGE_IP = '192.168.2.138'
 #TODO: read from thin-edge config
 THIN_EDGE_EXTERNAL_ID = 'home64-raspberry:device'
+LOCAL_PUBLISH_TOPIC = 'aitrios/me/inferences'
 image_cache = queue.Queue(maxsize=10)
 
 inferences_cache = queue.Queue(maxsize=10)
@@ -86,7 +87,7 @@ logging.basicConfig(
 
 
 class IMXMqttHandler(mqtt.Client):
-    START_COMMAND = r'start (\d+) (\d+)'
+    START_COMMAND = r'start (\d+) (\d+) (\w+) (\w+)'
     STOP_COMMAND = r'stop'
     TOPIC_CONNECT = r'v1/devices/([\w]+)/connect'
     TOPIC_TELEMETRY = r'v1/devices/([\w]+)/telemetry'
@@ -102,10 +103,13 @@ class IMXMqttHandler(mqtt.Client):
         self.device_id_long_map = {}
         self.pending_installations = {}
         self.existing_installations = {}
+        self.sending_to_cloud = True
+        self.sending_picture = True
         self.device_id_prefix = THIN_EDGE_EXTERNAL_ID
         self.on_message = self.on_message_handle
         self.on_connect = self.on_connect_handle
         self.connect('127.0.0.1', 1883)
+        
 
     def handle_auth(self, msg):
         self.token_auth = msg.payload.decode().split(',')[-1]
@@ -132,6 +136,16 @@ class IMXMqttHandler(mqtt.Client):
             if regex_match_start != None:
                 interval = int(regex_match_start.group(1))
                 classes = int(regex_match_start.group(2))
+                sending_mode = regex_match_start.group(3)
+                if sending_mode == 'cloud':
+                    self.sending_to_cloud = True
+                else:
+                    self.sending_to_cloud = False
+                incl_picture = regex_match_start.group(4)
+                if incl_picture == 'on':
+                    self.sending_picture = True
+                else:
+                    self.sending_picture = False
                 logging.info(f"Received start command for device {device_id} with interval {interval}")
                 # Set operation to EXECUTING
                 self.device_id_prefix = ":".join(msg_parts[1].split(':')[:-1])
@@ -510,72 +524,78 @@ class IMXMqttHandler(mqtt.Client):
     def refresh_token(self):
         self.publish('c8y/s/uat', '')
 
-def softmax(inferences):
-    x = []
-    for i in range(len(inferences.keys())):
-        x.append(inferences[str(i)])
-    e_x = np.exp(x - np.max(x))
-    results = e_x / e_x.sum()
-    results = results.tolist()
-    for i in range(len(results)):
-        inferences[str(i)] = round(results[i],4)
-    return inferences
+    def softmax(self, inferences):
+        x = []
+        for i in range(len(inferences.keys())):
+            x.append(inferences[str(i)])
+        e_x = np.exp(x - np.max(x))
+        results = e_x / e_x.sum()
+        results = results.tolist()
+        for i in range(len(results)):
+            inferences[str(i)] = round(results[i],4)
+        return inferences
 
-def decode_flatbuffer(inference):
-    buf_decode = base64.b64decode(inference)
-    ppl_out = ClassificationTop.ClassificationTop.GetRootAs(buf_decode, 0)
-    cls_data = ppl_out.Perception()
-    res_num = cls_data.ClassificationListLength()
-    # Store the deserialized data in json format.
-    output = {}
-    for i in range(res_num):
-        cls_list = cls_data.ClassificationList(i)
-        output[str(cls_list.ClassId())] = round(cls_list.Score(), 6)
-    return output
+    def decode_flatbuffer(self, inference):
+        buf_decode = base64.b64decode(inference)
+        ppl_out = ClassificationTop.ClassificationTop.GetRootAs(buf_decode, 0)
+        cls_data = ppl_out.Perception()
+        res_num = cls_data.ClassificationListLength()
+        # Store the deserialized data in json format.
+        output = {}
+        for i in range(res_num):
+            cls_list = cls_data.ClassificationList(i)
+            output[str(cls_list.ClassId())] = round(cls_list.Score(), 6)
+        return output
 
-def file_uploader():
-    while True:
-        inference_item = inferences_cache.get()
-        image_item = image_cache.get()
-        if inference_item is None:
-            time.sleep(1)
-        else:
-            HEADERS = {
-                'Authorization': 'Bearer ' + token_auth.token,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            }
-            inference_file_id, file_content = inference_item
-            decoded_flatbuffer = decode_flatbuffer(file_content['Inferences'][0]['O'])
-            softmaxed_inferences = softmax(decoded_flatbuffer)
-            file_content['Inferences'][0]['O'] = softmaxed_inferences
-            file_content['type'] = 'imx_inference'
-            file_content['source'] = {
-                #TODO: this is hardcoded for now and needs to change ones the camera can be identified on HTTP as well
-                'id': token_auth.source_map['me'],
-            }
-            file_content['time'] = datetime.datetime.strptime(inference_file_id, '%Y%m%d%H%M%S%f').isoformat()[:-3] + 'Z'
-            file_content['text'] = 'Inference result'
-            logging.debug(f"Created event with content {file_content}")
-            response = requests.post(C8Y_BASE + '/event/events', data=json.dumps(file_content), headers=HEADERS)
-            eventId = response.json()['id']
-            logging.debug(f"Created event with ID {eventId}")
-
-            image_file_id, image_content = image_item
-            IMAGE_HEADERS = {
-                'Authorization': 'Bearer ' + token_auth.token,
-                'Content-Type': 'application/octet-stream', 
-                'Content-Disposition': f'attachment; filename="{image_file_id}.jpg"'
-            }
-            requests.post(C8Y_BASE + '/event/events/' + eventId + '/binaries', data=image_content, headers=IMAGE_HEADERS)
-        inferences_cache.task_done()
-        image_cache.task_done()
+    def file_uploader(self):
+        while True:
+            inference_item = inferences_cache.get()
+            image_item = image_cache.get()
+            if inference_item is None:
+                time.sleep(1)
+            else:
+                inference_file_id, file_content = inference_item
+                decoded_flatbuffer = self.decode_flatbuffer(file_content['Inferences'][0]['O'])
+                softmaxed_inferences = self.softmax(decoded_flatbuffer)
+                file_content['Inferences'][0]['O'] = softmaxed_inferences
+                file_content['type'] = 'imx_inference'
+                file_content['time'] = datetime.datetime.strptime(inference_file_id, '%Y%m%d%H%M%S%f').isoformat()[:-3] + 'Z'
+                file_content['text'] = 'Inference result'
+                if self.sending_to_cloud:
+                    HEADERS = {
+                        'Authorization': 'Bearer ' + self.token_auth.token,
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    }
+                    file_content['source'] = {
+                        #TODO: this is hardcoded for now and needs to change ones the camera can be identified on HTTP as well
+                        'id': self.token_auth.source_map['me'],
+                    }
+                    logging.debug(f"Created event with content {file_content}")
+                    response = requests.post(C8Y_BASE + '/event/events', data=json.dumps(file_content), headers=HEADERS)
+                    eventId = response.json()['id']
+                    logging.debug(f"Created event with ID {eventId}")
+                    if self.sending_picture:
+                        image_file_id, image_content = image_item
+                        IMAGE_HEADERS = {
+                            'Authorization': 'Bearer ' + self.token_auth.token,
+                            'Content-Type': 'application/octet-stream', 
+                            'Content-Disposition': f'attachment; filename="{image_file_id}.jpg"'
+                        }
+                        requests.post(C8Y_BASE + '/event/events/' + eventId + '/binaries', data=image_content, headers=IMAGE_HEADERS)
+                else:
+                    self.publish(LOCAL_PUBLISH_TOPIC, json.dumps(file_content))
+            inferences_cache.task_done()
+            image_cache.task_done()
+    
+    def run_file_uploader(self):
+        threading.Thread(target=self.file_uploader, daemon=True).start()
 
 def main():
     # Start the Flask server 
     mqtt_client = IMXMqttHandler(token_auth)
     mqtt_client.loop_start()
-    threading.Thread(target=file_uploader, daemon=True).start()
+    mqtt_client.run_file_uploader()
 
     # Start the HTTP server
     app.run(host='0.0.0.0', port=HTTP_SERVER_PORT)
